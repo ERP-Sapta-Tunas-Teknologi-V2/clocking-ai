@@ -1,0 +1,101 @@
+1. Table: category_clocking
+
+category_id (int)
+
+category_description (varchar)
+
+is_productive (tinyint)
+
+is_billable (tinyint)
+
+is_used (tinyint)
+
+is_direct (tinyint)
+
+2. Table: clocking_activities
+
+activity_id (int)
+
+daily_activity_id (int)
+
+task_id (int)
+
+activity_description (text)
+
+duration_minutes (int)
+
+start_date (date)
+
+start_time (time)
+
+end_date (date)
+
+end_time (time)
+
+category_id (int)
+
+3. Table: daily_activities
+
+daily_activity_id (int)
+
+project_code (varchar)
+
+activity_date (datetime)
+
+priority (enum)
+
+start_time (timestamp)
+
+end_time (timestamp)
+
+created_by (varchar)
+
+created_at (timestamp)
+
+updated_at (timestamp)
+
+activity_type (enum)
+
+description (text)
+
+activity_duration_minutes (int)
+
+user_id (int)
+
+4. Table: project_users
+
+project_code (varchar)
+
+user_id (int)
+
+5. Table: projects
+
+project_code (varchar)
+
+project_name (varchar)
+
+customer_name (varchar)
+
+project_manager_id (int)
+
+created_by (varchar)
+
+created_at (timestamp)
+
+last_update (timestamp)
+
+status (enum)
+
+6. Table: users
+
+user_id (int)
+
+full_name (varchar)
+
+email (varchar)
+
+position (tinyint)
+
+created_at (timestamp)
+
+updated_at (timestamp)
