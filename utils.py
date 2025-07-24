@@ -2,7 +2,7 @@ import re
 
 def get_system_prompt():
     try:
-        with open("prompt.txt", "r", encoding="utf-8") as file:
+        with open("guardrail/prompt.txt", "r", encoding="utf-8") as file:
             prompt = file.read().strip()
         return prompt
     except FileNotFoundError:

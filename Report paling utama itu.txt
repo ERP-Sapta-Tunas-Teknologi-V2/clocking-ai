@@ -1,7 +1,0 @@
-Report paling utama itu :
-+ berapa jumlah clocking untuk user A? Hasil report yg diinginkan itu nanti berupa jumlah clocking user A dengan detail masing2 category 100, 200, 300 & 400
-- ⁠Top 5 over clocking & Top 5 under clocking. Hasil yg diharapkan itu nanti berupa 5 user dengan jumlah clocking terbanyak dan sedikit menampilkan detail category nya.
-- ⁠analisa untuk user B pada bulan 3. Hasil yg diharapkan berupa apakah pekerjaannya efisien dengan target clocking dalam bulan tersebut. 
-+ ⁠analisa user C dari bulan 1-3? Hasil yg diharapkan itu berupa analisa dari jumlah clocking user C dalam 3 bulan tersbut di compare dengan target clocking perbulan. 
-+ ⁠grafik clocking Month Of Month selama 4 bulan untuk user D pada category 400. Hasil yg diharapkan berupa grafik clocking khusus category 400 pada user D.
-- ⁠Tampilkan Report clocking untuk Tim PM. Hasil yg diharapkan itu berupa detail clocking yg sudh diinput keseluruhan member Tim PM berupa Top clocking sampai ke under clocking.
