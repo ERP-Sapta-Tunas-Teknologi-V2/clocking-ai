@@ -22,9 +22,8 @@ DB_CONFIG = {
 
 MODEL_LIST = ["qwen3:0.6b"]
 
-
 # ================================
-# ✅ SQL MAPPING
+# ✅ SQL MAPPING (TOOLS)
 # ================================
 
 SQL_MAPPING = {
@@ -56,7 +55,7 @@ SQL_MAPPING = {
               JOIN daily_activities da ON ca.daily_activity_id = da.daily_activity_id
               JOIN users u ON da.user_id = u.user_id
             WHERE u.full_name LIKE %s
-              AND MONTH(ca.start_date) BETWEEN 1 AND 3
+              AND MONTH(ca.start_date) BETWEEN %s AND %s
               AND YEAR(ca.start_date) = YEAR(CURDATE())
             GROUP BY DATE_FORMAT(ca.start_date, '%Y-%m')
             ORDER BY month ASC;
@@ -64,26 +63,35 @@ SQL_MAPPING = {
     }
 }
 
-
 # ================================
 # ✅ UTILITY FUNCTIONS
 # ================================
 
 def convert_decimal(obj):
     if isinstance(obj, Decimal):
-        return float(obj)  # atau str(obj) jika ingin presisi string
+        return float(obj)
     raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
 
 def extract_username(user_query: str):
     match = re.search(r"(?:user|untuk user|analisa user)\s+(\w+)", user_query, re.IGNORECASE)
     return match.group(1) if match else None
 
-def detect_sql_query_type(user_query: str):
-    if "clocking" in user_query.lower() and "4 bulan" in user_query.lower():
-        return "sql1"
-    elif "analisa user" in user_query.lower() and "bulan 1-3" in user_query.lower():
-        return "sql2"
-    return None
+def extract_time_range(user_query: str):
+    match = re.search(r"(?:dari|selama)\s+(?:bulan\s+)?(\d+(?:-\d+)?)", user_query.lower())
+    if match:
+        time_range = match.group(1)
+        if '-' in time_range:
+            start, end = map(int, time_range.split('-'))
+            return start, end
+        return int(time_range), int(time_range)
+    return 1, 3  # Default to 1-3 months if not found
+
+def select_sql_tool(model, query):
+    """Let LLM select the most appropriate SQL tool based on the query."""
+    prompt = f"""Given the following SQL tools and their descriptions, select the most appropriate one for the user query. Return only the tool name (e.g., 'sql1' or 'sql2').\n\nTools:\n{json.dumps(SQL_MAPPING, indent=2)}\n\nQuery: {query}"""
+    response = requests.post(OLLAMA_URL, json={"model": model, "prompt": prompt, "stream": False}).json()
+    selected_tool = response.get("response", "").strip()
+    return selected_tool if selected_tool in SQL_MAPPING else None
 
 def run_query(sql, params=None):
     try:
@@ -98,12 +106,8 @@ def run_query(sql, params=None):
         return f"Database error: {e}"
 
 def save_json_to_excel(json_data, filename="output.xlsx"):
-    """
-    Convert JSON data (list of dicts or dict) to Excel file.
-    """
     try:
         if isinstance(json_data, dict):
-            # If dict of lists, convert each key to its own sheet
             with pd.ExcelWriter(filename, engine='openpyxl') as writer:
                 for key, value in json_data.items():
                     pd.DataFrame(value).to_excel(writer, sheet_name=key, index=False)
@@ -111,7 +115,6 @@ def save_json_to_excel(json_data, filename="output.xlsx"):
             pd.DataFrame(json_data).to_excel(filename, index=False)
         else:
             raise ValueError("Unsupported JSON format")
-
         print(f"✅ Excel file saved as: {filename}")
     except Exception as e:
         print(f"❌ Error converting to Excel: {e}")
@@ -121,17 +124,14 @@ def generate_pdf(query: str, result_data, analysis: str) -> bytes:
     pdf.add_page()
     pdf.set_auto_page_break(auto=True, margin=15)
 
-    # Title
     pdf.set_font("Arial", "B", 16)
     pdf.cell(0, 10, "LLM Analysis Report", ln=True)
 
-    # Query Section
     pdf.set_font("Arial", "B", 12)
     pdf.cell(0, 10, "Query:", ln=True)
     pdf.set_font("Arial", "", 12)
     pdf.multi_cell(0, 10, query)
 
-    # Normalize result to DataFrame
     try:
         if isinstance(result_data, (list, tuple)):
             df = pd.DataFrame(result_data)
@@ -142,7 +142,6 @@ def generate_pdf(query: str, result_data, analysis: str) -> bytes:
     except Exception:
         df = pd.DataFrame()
 
-    # SQL Result Table
     if not df.empty:
         pdf.set_font("Arial", "B", 12)
         pdf.cell(0, 10, "SQL Result Table:", ln=True)
@@ -162,18 +161,13 @@ def generate_pdf(query: str, result_data, analysis: str) -> bytes:
         pdf.set_font("Arial", "", 12)
         pdf.cell(0, 10, "No SQL result data available.", ln=True)
 
-    # Analysis Section
     pdf.set_font("Arial", "B", 12)
     pdf.cell(0, 10, "LLM Analysis:", ln=True)
     pdf.set_font("Arial", "", 12)
     pdf.multi_cell(0, 10, analysis)
 
-    # Generate PDF content as bytes
-    pdf_bytes = pdf.output(dest='S').encode('latin1')  # FPDF returns str, must encode
+    pdf_bytes = pdf.output(dest='S').encode('latin1')
     return pdf_bytes
-
-
-
 
 def summarize_with_llm(model, result, query):
     url = "http://localhost:11434/api/generate"
@@ -250,40 +244,36 @@ def stream_response(model, prompt):
             except json.JSONDecodeError:
                 continue
 
-
 # ================================
 # ✅ STREAMLIT UI
 # ================================
 
-# Page title
 st.title("📊 LLM + MySQL Clocking Analysis")
 
-# Sidebar for history
 st.sidebar.title("📁 Query History")
 if 'history' not in st.session_state:
     st.session_state.history = []
 
-# Model selector
 selected_model = st.selectbox("Select Model", MODEL_LIST, index=0)
 
-# User input
 query = st.text_area("Enter your query:", placeholder="e.g. clocking Month Of Month selama 4 bulan untuk user juanrico.")
 submit_button = st.button("Submit")
-
 
 # ================================
 # ✅ MAIN QUERY HANDLER
 # ================================
 
 if submit_button and query:
-    sql_id = detect_sql_query_type(query)
+    sql_id = select_sql_tool(selected_model, query)
     if sql_id:
         username = extract_username(query)
         if not username:
             st.error("❌ Username not found in your query.")
         else:
+            start_month, end_month = extract_time_range(query)
             sql_template = SQL_MAPPING[sql_id]["query"]
-            result = run_query(sql_template, (f"%{username}%",))
+            params = (f"%{username}%",) if sql_id == "sql1" else (f"%{username}%", start_month, end_month)
+            result = run_query(sql_template, params)
             if isinstance(result, str):  # Error
                 st.error(result)
             else:
@@ -291,31 +281,23 @@ if submit_button and query:
                 st.write("📊 Result:")
                 st.json(result)
 
-                # Run LLM Analysis
                 st.info("🤖 Sending to LLM for analysis...")
                 final_analysis = summarize_with_llm(selected_model, result, query)
 
-                # Unpack the tuple BEFORE the download_button
                 final_response, final_think = final_analysis
 
-                # Prepare Excel download
                 if isinstance(result, list) and result:
                     df_result = pd.DataFrame(result)
 
-                    # Use BytesIO to hold Excel data
                     output = io.BytesIO()
                     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                        # Sheet 1: SQL Result
                         df_result.to_excel(writer, index=False, sheet_name="SQL Result")
-
-                        # Sheet 2: Summary
                         df_summary = pd.DataFrame({
-                            "Item": ["Query", "LLM Analysis Think", "LLM Analysis response"],
-                            "Content": [query, final_think ,final_response]
+                            "Item": ["Query", "LLM Analysis Think", "LLM Analysis Response"],
+                            "Content": [query, final_think, final_response]
                         })
                         df_summary.to_excel(writer, index=False, sheet_name="Analysis Summary")
 
-                    # Download button
                     st.download_button(
                         label="📥 Download Excel (with Analysis)",
                         data=output.getvalue(),
@@ -329,10 +311,7 @@ if submit_button and query:
                     file_name="analysis_report.pdf",
                     mime="application/pdf"
                 )
-
-
     else:
-        # Fallback to direct LLM prompt
         st.info("🧠 No SQL matched. Sending directly to LLM...")
         response_container = st.empty()
         think_container = st.empty()
@@ -355,7 +334,6 @@ if submit_button and query:
         except Exception as e:
             st.error(f"❌ Error: {e}")
 
-# Display history in sidebar
 for i, entry in enumerate(st.session_state.history):
     with st.sidebar.expander(f"Q{i+1}: {entry['query'][:30]}..."):
         st.write(f"**Question:** {entry['query']}")
