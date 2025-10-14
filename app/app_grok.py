@@ -17,6 +17,31 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as Re
 from reportlab.lib.styles import getSampleStyleSheet
 from io import BytesIO
 from streamlit_modal import Modal
+import os
+
+# Load environment variables from a .env file if present
+def load_env_file(env_path: str = ".env") -> None:
+    if os.path.exists(env_path):
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    # Do not override existing environment variables
+                    if key and key not in os.environ:
+                        os.environ[key] = value
+        except Exception:
+            # Silently continue if .env cannot be read; fall back to defaults
+            pass
+
+# Ensure env vars are loaded before Config is defined
+load_env_file()
 
 # ================================
 # ✅ CONFIGURATION
@@ -24,10 +49,10 @@ from streamlit_modal import Modal
 class Config:
     OLLAMA_URL = "http://localhost:11434/api/generate"
     DB_CONFIG = {
-        "host": "localhost",
-        "user": "root",
-        "password": "",  # Fill if needed
-        "database": "clocking_reports"
+        "host": os.getenv("DB_HOST", "localhost"),
+        "user": os.getenv("DB_USER", "root"),
+        "password": os.getenv("DB_PASSWORD", ""),
+        "database": os.getenv("DB_NAME", "clocking_reports"),
     }
     MODEL_LIST = ["qwen3:0.6b"]
     SQL_MAPPING = {

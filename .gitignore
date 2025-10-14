@@ -5,3 +5,60 @@ clocking_3.mp4
 clocking_2.mp4
 
 migration.docx
+
+# --- General OS/Editor ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+.Python
+.pytest_cache/
+.coverage
+coverage.xml
+
+# --- Environments ---
+venv/
+.venv/
+env/
+.env
+*.env.local
+
+# --- Streamlit ---
+.streamlit/secrets.toml
+.streamlit/
+
+# --- Logs & Temp ---
+*.log
+*.tmp
+*.cache/
+
+# --- Build/Dist ---
+dist/
+build/
+
+# --- Data & Artifacts ---
+*.sqlite
+*.db
+*.faiss
+*.pdf
+*.xlsx
+*.csv
+
+# --- Media ---
+*.mp4
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+# --- Docs ---
+*.docx
+
+# Keep tracked examples
+!.env.example
