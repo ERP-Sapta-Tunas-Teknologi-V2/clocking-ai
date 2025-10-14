@@ -47,7 +47,7 @@
 
 ### Migration Mapping from `ss_category_docking` to `category_clocking`
 
-| `ss_category_docking` Field | `category_clocking` Field      | Description                     |
+| `ss_category_clocking` Field | `category_clocking` Field      | Description                     |
 |-----------------------------|-------------------------------|---------------------------------|
 | `cc_id`                     | `category_id`                 | Category ID                     |
 | `cc_definition`             | `category_description`        | Category description            |
