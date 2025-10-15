@@ -1,6 +1,6 @@
 # Database Schema
 
-## Table: `users`
+## Table: `users` ambil dari `ss_user`
 
 | Field          | Description                                              |
 |----------------|----------------------------------------------------------|
@@ -12,7 +12,7 @@
 | `created_at`   | Account creation date (mapped from `created_at` in `ss_user`) |
 | `updated_at`   | Last update timestamp (mapped from `updated_at` in `ss_user`) |
 
-## Table: `projects`
+## Table: `projects` ambil dari `ss_project_management`
 
 | New Table Field         | Old Table Field (`ss_project_management`) | Description                     |
 |-------------------------|------------------------------------------|---------------------------------|
@@ -35,17 +35,28 @@
 }
 ```
 
-## Table: `project_users`
+## Table: `project_users` ambil dari JSON `pr_members`
 
-- Derived from JSON `pr_members` in the `ss_project_management` table.
+| New Table Field         | Old Table Field (`pr_members`) | Description                     |
+|-------------------------|--------------------------------|---------------------------------|
+| `project_code`          | `pr_project_code`              | Project code                    |
+| `user_id`               | `user_id`                      | User ID                         |
+| `role`                  | `role`                         | Role in the project             |
 
-## Table: `daily_activities`
+## Table: `daily_activities` ambil dari JSON `da_data`
 
-- Derived from JSON `da_data` in the `ss_daily_activity` table.
+| New Table Field         | Old Table Field (`da_data`) | Description                     |
+|-------------------------|----------------------------|---------------------------------|
+| `daily_activity_id`     | `da_id`                    | Unique ID for daily activity     |
+| `project_code`          | `da_project_code`          | Project code                    |
+| `activity_date`         | `da_date`                  | Date of activity                 |
+| `priority`              | `da_priority`              | Activity priority                |
+| `start_time`            | `da_start_tm`              | Start time of activity           |
+| `end_time`              | `da_end_tm`                | End time of activity             |
 
 ## Table: `category_clocking`
 
-### Migration Mapping from `ss_category_docking` to `category_clocking`
+### Migration Mapping from `category_clocking` ambil dari `ss_category_clocking`
 
 | `ss_category_clocking` Field | `category_clocking` Field      | Description                     |
 |-----------------------------|-------------------------------|---------------------------------|
@@ -58,7 +69,7 @@
 
 ## Table: `daily_activity`
 
-### Mapping from `daily_activity` (First Table) to `da_activity` (Second Table)
+### Mapping from `daily_activity` ambil dari `da_activity` 
 
 | `daily_activity` Field      | `da_activity` Field         | Description                              |
 |-----------------------------|----------------------------|------------------------------------------|
