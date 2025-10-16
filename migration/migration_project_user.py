@@ -1,5 +1,7 @@
 import mysql.connector
 import json
+from datetime import datetime
+import argparse
 
 def connect_db(host, user, password, db):
     return mysql.connector.connect(
@@ -56,7 +58,53 @@ def get_or_create_user(target_cursor, lookup_cursor, email, nickname, jabatan, i
     )
     return new_user_id
 
-def migrate_project_users():
+def ensure_migration_state_table(target_cursor):
+    try:
+        target_cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS migration_state (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                job_name VARCHAR(128) UNIQUE,
+                last_updated_at DATETIME NULL,
+                last_id BIGINT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            )
+            """
+        )
+    except Exception:
+        pass
+
+
+def get_watermark(target_cursor, job_name):
+    try:
+        target_cursor.execute(
+            "SELECT last_updated_at, last_id FROM migration_state WHERE job_name = %s",
+            (job_name,),
+        )
+        row = target_cursor.fetchone()
+        if row:
+            return row[0], row[1]
+    except Exception:
+        pass
+    return None, None
+
+
+def update_watermark(target_cursor, target_db, job_name, last_updated_at, last_id):
+    try:
+        target_cursor.execute(
+            """
+            INSERT INTO migration_state (job_name, last_updated_at, last_id)
+            VALUES (%s, %s, %s)
+            ON DUPLICATE KEY UPDATE last_updated_at = VALUES(last_updated_at), last_id = VALUES(last_id)
+            """,
+            (job_name, last_updated_at, last_id),
+        )
+        target_db.commit()
+    except Exception:
+        pass
+
+
+def migrate_project_users(mode: str = "incremental", since: str = None, limit: int = None, dry_run: bool = False):
     config = {
         "host": "localhost",
         "user": "root",
@@ -70,32 +118,55 @@ def migrate_project_users():
     target_cursor = target_db.cursor()
     user_lookup_cursor = target_db.cursor()
 
+    ensure_migration_state_table(target_cursor)
+    wm_updated_at, wm_last_id = get_watermark(target_cursor, "ss_project_management_members")
+
     # Prepare next user_id generator for placeholder users (if table lacks AUTO_INCREMENT)
     user_lookup_cursor.execute("SELECT COALESCE(MAX(user_id), 0) FROM users")
     current_max_user_id = user_lookup_cursor.fetchone()[0] or 0
     state = {"max_user_id": current_max_user_id}
+
     def next_user_id():
         state["max_user_id"] += 1
         return state["max_user_id"]
 
-    source_cursor.execute("SELECT pr_project_code, pr_members FROM ss_project_management")
+    base_query = (
+        """
+        SELECT pr_project_code, pr_members, pr_created_date, pr_last_update
+        FROM ss_project_management
+        """
+    )
+    params = []
+    where_clauses = []
+    effective_since = None if mode == "full" else (since or (wm_updated_at.isoformat(sep=' ') if isinstance(wm_updated_at, datetime) else None))
+    if effective_since:
+        where_clauses.append(
+            "((pr_last_update IS NOT NULL AND pr_last_update >= %s) OR (pr_created_date IS NOT NULL AND pr_created_date >= %s))"
+        )
+        params.extend([effective_since, effective_since])
+
+    if where_clauses:
+        base_query += " WHERE " + " AND ".join(where_clauses)
+    base_query += " ORDER BY pr_last_update ASC, pr_project_code ASC"
+    if limit and isinstance(limit, int) and limit > 0:
+        base_query += f" LIMIT {int(limit)}"
+
+    source_cursor.execute(base_query, tuple(params) if params else None)
     rows = source_cursor.fetchall()
 
     insert_query = "INSERT INTO project_users (project_code, user_id) VALUES (%s, %s)"
     inserted_count = 0
     skipped_count = 0
     duplicate_skipped = 0
+    max_updated_at = None
 
     for row in rows:
         project_code = row["pr_project_code"]
         members_json = row["pr_members"]
-
-        if not members_json or members_json.strip() == "":
+        if not members_json or str(members_json).strip() == "":
             continue
-
         try:
             members = json.loads(members_json)
-            # Expecting dict: {id_key: { email, id_key, jabatan, nickname }}
             if isinstance(members, dict):
                 for id_key, member in members.items():
                     if not isinstance(member, dict):
@@ -104,12 +175,12 @@ def migrate_project_users():
                     email = member.get("email")
                     nickname = member.get("nickname")
                     jabatan = member.get("jabatan")
-                    # Get or create user in target DB to avoid skips
                     user_id = get_or_create_user(target_cursor, user_lookup_cursor, email, nickname, jabatan, id_key, next_user_id)
                     if project_user_exists(target_cursor, project_code, user_id):
                         duplicate_skipped += 1
                         continue
-                    target_cursor.execute(insert_query, (project_code, user_id))
+                    if not dry_run:
+                        target_cursor.execute(insert_query, (project_code, user_id))
                     inserted_count += 1
             else:
                 skipped_count += 1
@@ -117,10 +188,22 @@ def migrate_project_users():
         except json.JSONDecodeError:
             print(f"⚠️ JSON parse error in project {project_code}, skipping row.")
 
-    target_db.commit()
+        upd = row.get("pr_last_update") or row.get("pr_created_date")
+        try:
+            if isinstance(upd, datetime):
+                max_updated_at = upd if (max_updated_at is None or upd > max_updated_at) else max_updated_at
+        except Exception:
+            pass
+
+    if not dry_run:
+        target_db.commit()
+
     print(f"✅ Inserted: {inserted_count} rows.")
     print(f"⚠️ Skipped: {skipped_count} rows due to missing email/user or bad JSON.")
     print(f"ℹ️ Duplicate pairs ignored: {duplicate_skipped} rows.")
+
+    if (mode == "incremental" or effective_since) and not dry_run:
+        update_watermark(target_cursor, target_db, "ss_project_management_members", max_updated_at, None)
 
     # Cleanup
     source_cursor.close()
@@ -130,4 +213,10 @@ def migrate_project_users():
     target_db.close()
 
 if __name__ == "__main__":
-    migrate_project_users()
+    parser = argparse.ArgumentParser(description="Migrate project-users links with incremental mode")
+    parser.add_argument("--mode", choices=["incremental", "full"], default="incremental")
+    parser.add_argument("--since", type=str, default=None)
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+    migrate_project_users(mode=args.mode, since=args.since, limit=args.limit, dry_run=args.dry_run)

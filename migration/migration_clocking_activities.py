@@ -1,6 +1,7 @@
 import mysql.connector
 import json
 from datetime import datetime
+import argparse
 
 def connect_db(host, user, password, db):
     return mysql.connector.connect(
@@ -123,7 +124,55 @@ def backfill_clocking_fields(target_cursor, target_db):
     target_db.commit()
 
 
-def migrate_daily_activity():
+def ensure_migration_state_table(target_cursor):
+    try:
+        target_cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS migration_state (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                job_name VARCHAR(128) UNIQUE,
+                last_updated_at DATETIME NULL,
+                last_id BIGINT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            )
+            """
+        )
+    except Exception:
+        # Best-effort; if fails, incremental mode will fall back to full scan
+        pass
+
+
+def get_watermark(target_cursor, job_name):
+    try:
+        target_cursor.execute(
+            "SELECT last_updated_at, last_id FROM migration_state WHERE job_name = %s",
+            (job_name,)
+        )
+        row = target_cursor.fetchone()
+        if row:
+            return row[0], row[1]
+    except Exception:
+        pass
+    return None, None
+
+
+def update_watermark(target_cursor, target_db, job_name, last_updated_at, last_id):
+    try:
+        target_cursor.execute(
+            """
+            INSERT INTO migration_state (job_name, last_updated_at, last_id)
+            VALUES (%s, %s, %s)
+            ON DUPLICATE KEY UPDATE last_updated_at = VALUES(last_updated_at), last_id = VALUES(last_id)
+            """,
+            (job_name, last_updated_at, last_id)
+        )
+        target_db.commit()
+    except Exception:
+        # Best-effort; do not break migration because watermark update fails
+        pass
+
+
+def migrate_daily_activity(mode: str = "incremental", since: str = None, limit: int = None, dry_run: bool = False):
     config = {
         "host": "localhost",
         "user": "root",
@@ -137,7 +186,27 @@ def migrate_daily_activity():
     target_cursor = target_db.cursor()
     user_lookup_cursor = source_db.cursor()  # Lookup id from ss_user in source DB
 
-    source_cursor.execute("SELECT * FROM ss_daily_activity")
+    # Ensure watermark table exists
+    ensure_migration_state_table(target_cursor)
+    wm_updated_at, wm_last_id = get_watermark(target_cursor, "ss_daily_activity")
+
+    # Build incremental query
+    base_query = "SELECT * FROM ss_daily_activity"
+    params = []
+    where_clauses = []
+
+    effective_since = since or (wm_updated_at.isoformat(sep=' ') if isinstance(wm_updated_at, datetime) else None)
+    if effective_since:
+        where_clauses.append("((da_updated_date IS NOT NULL AND da_updated_date >= %s) OR (da_created_date IS NOT NULL AND da_created_date >= %s))")
+        params.extend([effective_since, effective_since])
+
+    if where_clauses:
+        base_query += " WHERE " + " AND ".join(where_clauses)
+    base_query += " ORDER BY da_updated_date ASC, da_id ASC"
+    if limit and isinstance(limit, int) and limit > 0:
+        base_query += f" LIMIT {int(limit)}"
+
+    source_cursor.execute(base_query, tuple(params) if params else None)
     rows = source_cursor.fetchall()
 
     insert_query = """
@@ -153,6 +222,8 @@ def migrate_daily_activity():
     inserted_with_user = 0
     inserted_without_user = 0
     skipped_parse_errors = 0
+    max_updated_at = None
+    max_id = None
 
     for row in rows:
         # Extract id_key from da_data JSON
@@ -169,39 +240,54 @@ def migrate_daily_activity():
         if user_key:
             user_id = get_user_id_from_key(user_lookup_cursor, user_key)
 
-        # Avoid duplicate if already present
+        # Track maxima
         da_id = row.get("da_id")
+        upd = row.get("da_updated_date") or row.get("da_created_date")
+        try:
+            if isinstance(upd, datetime):
+                max_updated_at = upd if (max_updated_at is None or upd > max_updated_at) else max_updated_at
+            max_id = da_id if (max_id is None or (da_id is not None and da_id > max_id)) else max_id
+        except Exception:
+            pass
+
+        # Avoid duplicate if already present
         if daily_activity_exists(target_cursor, da_id):
             continue
 
-        target_cursor.execute(insert_query, (
-            da_id,
-            row.get("da_project_code"),
-            row.get("da_date"),
-            map_priority(row.get("da_priority")),
-            row.get("da_start_tm"),
-            row.get("da_end_tm"),
-            row.get("da_created_by"),
-            row.get("da_created_date"),
-            row.get("da_updated_date"),
-            row.get("da_activity"),
-            row.get("da_keterangan"),
-            row.get("da_duration"),
-            user_id,
-        ))
+        if not dry_run:
+            target_cursor.execute(insert_query, (
+                da_id,
+                row.get("da_project_code"),
+                row.get("da_date"),
+                map_priority(row.get("da_priority")),
+                row.get("da_start_tm"),
+                row.get("da_end_tm"),
+                row.get("da_created_by"),
+                row.get("da_created_date"),
+                row.get("da_updated_date"),
+                row.get("da_activity"),
+                row.get("da_keterangan"),
+                row.get("da_duration"),
+                user_id,
+            ))
         inserted_total += 1
         if user_id is not None:
             inserted_with_user += 1
         else:
             inserted_without_user += 1
 
-    target_db.commit()
+    if not dry_run:
+        target_db.commit()
     print(
         f"✅ Inserted: {inserted_total} daily activity records. "
         f"(with user: {inserted_with_user}, without user: {inserted_without_user})"
     )
     if skipped_parse_errors:
         print(f"⚠️ JSON parse issues: {skipped_parse_errors} records (da_data invalid).")
+
+    # Update watermark if running incremental and not dry-run
+    if (mode == "incremental" or effective_since) and not dry_run:
+        update_watermark(target_cursor, target_db, "ss_daily_activity", max_updated_at, max_id)
 
     source_cursor.close()
     target_cursor.close()
@@ -210,7 +296,7 @@ def migrate_daily_activity():
     target_db.close()
 
 
-def migrate_clocking_activities():
+def migrate_clocking_activities(mode: str = "incremental", since: str = None, limit: int = None, dry_run: bool = False):
     config = {
         "host": "localhost",
         "user": "root",
@@ -223,8 +309,12 @@ def migrate_clocking_activities():
     source_cursor = source_db.cursor(dictionary=True)
     target_cursor = target_db.cursor()
 
+    # Ensure watermark table exists
+    ensure_migration_state_table(target_cursor)
+    wm_updated_at, wm_last_id = get_watermark(target_cursor, "ss_daily_activity")
+
     # Fetch required fields including fallbacks when da_clocking is empty
-    source_cursor.execute(
+    base_query = (
         """
         SELECT 
             da_id,
@@ -244,6 +334,21 @@ def migrate_clocking_activities():
         FROM ss_daily_activity
         """
     )
+    params = []
+    where_clauses = []
+
+    effective_since = since or (wm_updated_at.isoformat(sep=' ') if isinstance(wm_updated_at, datetime) else None)
+    if effective_since:
+        where_clauses.append("((da_updated_date IS NOT NULL AND da_updated_date >= %s) OR (da_created_date IS NOT NULL AND da_created_date >= %s))")
+        params.extend([effective_since, effective_since])
+
+    if where_clauses:
+        base_query += " WHERE " + " AND ".join(where_clauses)
+    base_query += " ORDER BY da_updated_date ASC, da_id ASC"
+    if limit and isinstance(limit, int) and limit > 0:
+        base_query += f" LIMIT {int(limit)}"
+
+    source_cursor.execute(base_query, tuple(params) if params else None)
     rows = source_cursor.fetchall()
 
     # Preload existing daily_activity IDs from target to satisfy FK constraints
@@ -280,6 +385,8 @@ def migrate_clocking_activities():
     inserted_from_fallback = 0
     skipped_count = 0
     category_fixed_count = 0
+    max_updated_at = None
+    max_id = None
 
     for row in rows:
         da_id = row["da_id"]
@@ -302,6 +409,15 @@ def migrate_clocking_activities():
                 # Fall back to empty list on invalid JSON
                 da_clocking = []
 
+        # Track maxima
+        upd = row.get("da_updated_date") or row.get("da_created_date")
+        try:
+            if isinstance(upd, datetime):
+                max_updated_at = upd if (max_updated_at is None or upd > max_updated_at) else max_updated_at
+            max_id = da_id if (max_id is None or (da_id is not None and da_id > max_id)) else max_id
+        except Exception:
+            pass
+
         # Ensure parent daily_activities exists; auto-create minimal row if missing
         if da_id not in existing_daily_ids:
             # Try map user via id_key -> placeholder email
@@ -315,25 +431,26 @@ def migrate_clocking_activities():
             except json.JSONDecodeError:
                 id_key = None
             user_id = get_target_user_id_from_id_key(target_cursor, id_key)
-
-            target_cursor.execute(
-                daily_insert_query,
-                (
-                    da_id,
-                    row.get("da_project_code"),
-                    row.get("da_date"),
-                    map_priority(row.get("da_priority")),
-                    row.get("da_start_tm"),
-                    row.get("da_end_tm"),
-                    row.get("da_created_by"),
-                    row.get("da_created_date"),
-                    row.get("da_updated_date"),
-                    row.get("da_activity"),
-                    row.get("da_keterangan"),
-                    row.get("da_duration"),
-                    user_id,
-                ),
-            )
+            if not dry_run:
+                target_cursor.execute(
+                    daily_insert_query,
+                    (
+                        da_id,
+                        row.get("da_project_code"),
+                        row.get("da_date"),
+                        map_priority(row.get("da_priority")),
+                        row.get("da_start_tm"),
+                        row.get("da_end_tm"),
+                        row.get("da_created_by"),
+                        row.get("da_created_date"),
+                        row.get("da_updated_date"),
+                        row.get("da_activity"),
+                        row.get("da_keterangan"),
+                        row.get("da_duration"),
+                        user_id,
+                    ),
+                )
+            # Update local set to avoid double counting even in dry-run
             existing_daily_ids.add(da_id)
 
         if isinstance(da_clocking, list) and len(da_clocking) > 0:
@@ -364,17 +481,18 @@ def migrate_clocking_activities():
                     category_id = DEFAULT_CATEGORY_ID
                     category_fixed_count += 1
 
-                target_cursor.execute(insert_query, (
-                    da_id,
-                    task_id,
-                    activity,
-                    duration,
-                    start_date,
-                    start_time,
-                    end_date,
-                    end_time,
-                    category_id,
-                ))
+                if not dry_run:
+                    target_cursor.execute(insert_query, (
+                        da_id,
+                        task_id,
+                        activity,
+                        duration,
+                        start_date,
+                        start_time,
+                        end_date,
+                        end_time,
+                        category_id,
+                    ))
                 inserted_total += 1
                 inserted_from_json += 1
         else:
@@ -411,22 +529,24 @@ def migrate_clocking_activities():
 
             # Only insert fallback if this daily_activity_id has no existing clocking entries
             if da_id not in daily_ids_with_clockings:
-                target_cursor.execute(insert_query, (
-                    da_id,
-                    None,  # task_id unknown when no JSON
-                    activity_desc,
-                    duration_minutes,
-                    start_date,
-                    start_time,
-                    end_date,
-                    end_time,
-                    DEFAULT_CATEGORY_ID,  # use default category
-                ))
+                if not dry_run:
+                    target_cursor.execute(insert_query, (
+                        da_id,
+                        None,  # task_id unknown when no JSON
+                        activity_desc,
+                        duration_minutes,
+                        start_date,
+                        start_time,
+                        end_date,
+                        end_time,
+                        DEFAULT_CATEGORY_ID,  # use default category
+                    ))
                 inserted_total += 1
                 inserted_from_fallback += 1
                 daily_ids_with_clockings.add(da_id)
 
-    target_db.commit()
+    if not dry_run:
+        target_db.commit()
     print(
         f"✅ Inserted: {inserted_total} clocking activity records. "
         f"(JSON: {inserted_from_json}, Fallback: {inserted_from_fallback}, "
@@ -435,16 +555,22 @@ def migrate_clocking_activities():
     print(f"⚠️ Skipped: {skipped_count} records due to insufficient data.")
 
     # Jalankan backfill setelah migrasi untuk merapikan kolom
-    backfill_clocking_fields(target_cursor, target_db)
+    if not dry_run:
+        backfill_clocking_fields(target_cursor, target_db)
 
     # Verifikasi singkat
-    target_cursor.execute("SELECT COUNT(*) FROM clocking_activities WHERE task_id=0")
-    task_zero = target_cursor.fetchone()[0]
-    target_cursor.execute("SELECT COUNT(*) FROM clocking_activities WHERE task_id IS NULL")
-    task_null = target_cursor.fetchone()[0]
-    target_cursor.execute("SELECT COUNT(*) FROM clocking_activities WHERE duration_minutes IS NULL")
-    duration_null = target_cursor.fetchone()[0]
-    print(f"🔎 Backfill check — task_id=0: {task_zero}, task_id NULL: {task_null}, duration NULL: {duration_null}")
+    if not dry_run:
+        target_cursor.execute("SELECT COUNT(*) FROM clocking_activities WHERE task_id=0")
+        task_zero = target_cursor.fetchone()[0]
+        target_cursor.execute("SELECT COUNT(*) FROM clocking_activities WHERE task_id IS NULL")
+        task_null = target_cursor.fetchone()[0]
+        target_cursor.execute("SELECT COUNT(*) FROM clocking_activities WHERE duration_minutes IS NULL")
+        duration_null = target_cursor.fetchone()[0]
+        print(f"🔎 Backfill check — task_id=0: {task_zero}, task_id NULL: {task_null}, duration NULL: {duration_null}")
+
+    # Update watermark if running incremental and not dry-run
+    if (mode == "incremental" or effective_since) and not dry_run:
+        update_watermark(target_cursor, target_db, "ss_daily_activity", max_updated_at, max_id)
 
     source_cursor.close()
     target_cursor.close()
@@ -452,6 +578,13 @@ def migrate_clocking_activities():
     target_db.close()
 
 if __name__ == "__main__":
-    # Jalankan migrasi daily activities terlebih dahulu, lalu clocking
-    migrate_daily_activity()
-    migrate_clocking_activities()
+    parser = argparse.ArgumentParser(description="Migrate daily and clocking activities with incremental support")
+    parser.add_argument("--mode", choices=["incremental", "full"], default="incremental", help="Run mode")
+    parser.add_argument("--since", type=str, default=None, help="Process records updated/created since this DATETIME (YYYY-MM-DD[ HH:MM:SS])")
+    parser.add_argument("--limit", type=int, default=None, help="Limit number of source rows to process")
+    parser.add_argument("--dry-run", action="store_true", help="Do not insert/update; only compute and print counts")
+    args = parser.parse_args()
+
+    print(f"🚀 Running migration (mode={args.mode}, since={args.since}, limit={args.limit}, dry_run={args.dry_run})")
+    migrate_daily_activity(mode=args.mode, since=args.since, limit=args.limit, dry_run=args.dry_run)
+    migrate_clocking_activities(mode=args.mode, since=args.since, limit=args.limit, dry_run=args.dry_run)

@@ -223,11 +223,34 @@ This project includes migration scripts to import and normalize data from the le
 ### How to Run
 - Open terminal in `c:\laragon\www\clocking-ai\migration`.
 - Execute scripts one by one:
-  - `python migration_user.py`
-  - `python migration_project.py`
-  - `python migration_project_user.py`
-  - `python migration_category_clocking.py`
-  - `python migration_clocking_activities.py`
+  - `python migration_user.py` (see incremental options below)
+  - `python migration_project.py` (see incremental options below)
+  - `python migration_project_user.py` (see incremental options below)
+  - `python migration_category_clocking.py` (see incremental options below)
+  - `python migration_clocking_activities.py` (see incremental options below)
+
+#### Incremental Runs (Recommended for data that keeps growing)
+`migration_clocking_activities.py` mendukung mode incremental agar aman di-run berulang tanpa menggandakan data. Gunakan flags berikut:
+
+- `--mode incremental|full` (default `incremental`)
+  - `incremental`: hanya proses baris yang baru/di-update berdasarkan watermark terakhir.
+  - `full`: proses semua baris (gunakan untuk initial load).
+- `--since YYYY-MM-DD[ HH:MM:SS]` (opsional): override watermark dan proses sejak tanggal/waktu tertentu.
+- `--limit N` (opsional): batasi jumlah baris sumber yang diproses per run.
+- `--dry-run` (opsional): tidak melakukan insert/update; hanya menghitung dan menampilkan ringkasan.
+
+Contoh pemakaian:
+
+- Initial/full load:
+  - `python migration_clocking_activities.py --mode full`
+- Harian incremental (tanpa batas):
+  - `python migration_clocking_activities.py --mode incremental`
+- Incremental sejak tanggal tertentu dan batasi 10k baris:
+  - `python migration_clocking_activities.py --mode incremental --since 2025-01-01 --limit 10000`
+- Cek terlebih dulu tanpa menulis ke DB:
+  - `python migration_clocking_activities.py --mode incremental --dry-run`
+
+Watermark disimpan di tabel `migration_state` pada database target dan otomatis di-update setiap run non `--dry-run`. Jika flag `--since` diberikan, skrip akan memproses berdasarkan nilai tersebut dan tetap memperbarui watermark sesuai data yang diproses.
 
 ### Script Details
 - `migration_project_user.py`
