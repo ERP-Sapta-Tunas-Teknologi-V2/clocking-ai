@@ -36,7 +36,7 @@ def migrate_daily_activity():
 
     source_cursor = source_db.cursor(dictionary=True)
     target_cursor = target_db.cursor()
-    user_lookup_cursor = target_db.cursor()  # For looking up user_id
+    user_lookup_cursor = target_db.cursor()  # For looking up user_id (cross-DB query is fully qualified)
 
     source_cursor.execute("SELECT * FROM ss_daily_activity")  # Adjusted table name
     rows = source_cursor.fetchall()
@@ -50,51 +50,55 @@ def migrate_daily_activity():
         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
 
-    inserted_count = 0
-    skipped_count = 0
+    inserted_total = 0
+    inserted_with_user = 0
+    inserted_without_user = 0
+    skipped_parse_errors = 0
 
     for row in rows:
-        # Extract the id_key from the da_data JSON
+        # Extract the id_key from the da_data JSON; fall back gracefully when missing/invalid
         da_data = row.get("da_data", "{}")
+        user_key = None
         try:
             da_data_json = json.loads(da_data)
-            user_key = da_data_json.get("id_key")
-
-            if user_key:
-                # Get user_id from ss_user table using the id_key
-                user_id = get_user_id_from_key(user_lookup_cursor, user_key)
-
-                if user_id:
-                    # Insert into daily_activity table if user exists
-                    target_cursor.execute(insert_query, (
-                        row["da_id"],
-                        row["da_project_code"],
-                        row["da_date"],
-                        map_priority(row["da_priority"]),  # Map the priority value
-                        row["da_start_tm"],
-                        row["da_end_tm"],
-                        row["da_created_by"],
-                        row["da_created_date"],
-                        row["da_updated_date"],
-                        row["da_activity"],
-                        row["da_keterangan"],
-                        row["da_duration"],
-                        user_id  # Use the resolved user_id
-                    ))
-                    inserted_count += 1
-                else:
-                    print(f"⚠️ user_key {user_key} not found in ss_user table. Skipping project {row['da_project_code']}.")
-                    skipped_count += 1
-            else:
-                print(f"⚠️ No id_key found in da_data for project {row['da_project_code']}. Skipping.")
-                skipped_count += 1
+            if isinstance(da_data_json, dict):
+                user_key = da_data_json.get("id_key")
         except json.JSONDecodeError:
-            print(f"⚠️ Failed to parse da_data JSON for project {row['da_project_code']}. Skipping.")
-            skipped_count += 1
+            skipped_parse_errors += 1
+
+        user_id = None
+        if user_key:
+            user_id = get_user_id_from_key(user_lookup_cursor, user_key)
+
+        # Insert regardless; if user_id is not found, use NULL to satisfy FK
+        target_cursor.execute(insert_query, (
+            row["da_id"],
+            row["da_project_code"],
+            row["da_date"],
+            map_priority(row["da_priority"]),  # Map the priority value (or None)
+            row["da_start_tm"],
+            row["da_end_tm"],
+            row["da_created_by"],
+            row["da_created_date"],
+            row["da_updated_date"],
+            row["da_activity"],
+            row["da_keterangan"],
+            row["da_duration"],
+            user_id  # May be None
+        ))
+        inserted_total += 1
+        if user_id is not None:
+            inserted_with_user += 1
+        else:
+            inserted_without_user += 1
 
     target_db.commit()
-    print(f"✅ Inserted: {inserted_count} daily activity records.")
-    print(f"⚠️ Skipped: {skipped_count} records due to missing or deleted users.")
+    print(
+        f"✅ Inserted: {inserted_total} daily activity records. "
+        f"(with user: {inserted_with_user}, without user: {inserted_without_user})"
+    )
+    if skipped_parse_errors:
+        print(f"⚠️ JSON parse issues: {skipped_parse_errors} records (da_data invalid).")
 
     source_cursor.close()
     target_cursor.close()

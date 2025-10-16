@@ -39,17 +39,25 @@ def migrate_users():
 
     insert_query = """
         INSERT INTO users (
-            user_id, user_key, full_name, email, position, created_at, updated_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+            user_id, full_name, email, position, created_at, updated_at
+        ) VALUES (%s, %s, %s, %s, %s, %s)
     """
+
+    def normalize_position(value):
+        # Attempt to coerce jabatan to tinyint; fall back to NULL
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            return None
 
     for user in users:
         target_cursor.execute(insert_query, (
             user['user_id'],
-            user['user_key'],
             user['full_name'],
             user['email'],
-            user['position'],
+            normalize_position(user['position']),
             user['created_at'],
             user['updated_at'],
         ))
