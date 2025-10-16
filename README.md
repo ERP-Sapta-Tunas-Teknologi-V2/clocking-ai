@@ -203,6 +203,71 @@ Note: In the current implementation, `project_users` contains `project_code` and
 | `activity_duration_minutes`   | `da_duration`        | Duration of activity in minutes          |
 | (Mapped to `user_id`)         | `da_user_id`         | User ID (assumed to map to `created_by` or similar) |
 
+## Migration
+
+This project includes migration scripts to import and normalize data from the legacy database `system-smartpro` into the target database `clocking_reports`.
+
+### Overview
+- Location: `migration/`
+- Source DB: `system-smartpro`
+- Target DB: `clocking_reports`
+- Idempotency: Scripts use duplicate checks where applicable; prefer running in the order below.
+
+### Run Order
+- `migration_user.py` → imports base user records.
+- `migration_project.py` → imports projects and status mapping.
+- `migration_project_user.py` → links projects to users (creates users if missing).
+- `migration_category_clocking.py` → imports category definitions.
+- `migration_clocking_activities.py` → imports daily activities (auto-create parents) and clocking activities, then backfills fields.
+
+### How to Run
+- Open terminal in `c:\laragon\www\clocking-ai\migration`.
+- Execute scripts one by one:
+  - `python migration_user.py`
+  - `python migration_project.py`
+  - `python migration_project_user.py`
+  - `python migration_category_clocking.py`
+  - `python migration_clocking_activities.py`
+
+### Script Details
+- `migration_project_user.py`
+  - Reads `ss_project_management.pr_members` JSON with fields like `email`, `id_key`, `jabatan`, `nickname`.
+  - Looks up users by `email`; if not found or email missing, creates a placeholder user with `id_key@placeholder.local`.
+  - Generates `user_id` using `MAX(user_id)+1` to handle tables without `AUTO_INCREMENT`.
+  - Prevents duplicate `(project_code, user_id)` inserts in `project_users`.
+  - Typical outcome: previously skipped rows due to missing emails are inserted; existing pairs are ignored.
+
+- `migration_clocking_activities.py`
+  - Computes `duration_minutes` from `start_date`/`start_time` and `end_date`/`end_time` when missing; falls back to `0` if still `NULL`.
+  - Maps `task_id` based on `activity_description`: `remote|wfh` → `1`, `onsite|wfo` → `7`, otherwise `NULL`.
+  - Converts any existing `task_id=0` to `NULL`.
+  - Auto-creates missing parent `daily_activities` when absent (maps `priority` and optional `user_id` from `id_key`).
+  - Runs a backfill step automatically after insertion and prints verification counts for `task_id` and `duration_minutes`.
+
+- `migration_user.py`
+  - Imports base users from `ss_user` into `users`.
+  - Maps common fields (`full_name`, `email`, `position`, timestamps). Optional keys like `user_key` can be added if present.
+
+- `migration_project.py`
+  - Imports `projects` from `ss_project_management` with status mapping:
+    - `p` → `progress`, `f` → `finished`, `i` → `initial`, `c` → `cancelled`.
+
+- `migration_category_clocking.py`
+  - Imports category definitions from `ss_category_clocking` into `category_clocking`.
+
+### Verification SQL
+- `SELECT COUNT(*) FROM clocking_activities WHERE task_id = 0;` → should be `0`.
+- `SELECT COUNT(*) FROM clocking_activities WHERE task_id IS NULL;` → expected for unknown tasks.
+- `SELECT COUNT(*) FROM clocking_activities WHERE duration_minutes IS NULL;` → should be `0` after backfill.
+- `SELECT COUNT(*) FROM project_users pu LEFT JOIN users u ON pu.user_id = u.user_id WHERE u.user_id IS NULL;` → should be `0`.
+- `SELECT COUNT(*) FROM users WHERE email LIKE '%@placeholder.local';` → count of placeholder users created.
+
+### Notes & Troubleshooting
+- Re-running scripts: `project_users` is protected from duplicates; for other tables, avoid double-inserting unless scripts include explicit duplicate checks.
+- Error `Field 'user_id' doesn't have a default value`: ensure the migration creates `user_id` using `MAX(user_id)+1` or set `AUTO_INCREMENT` on the table.
+- Legacy `user_key` lookups were replaced by email-based lookups in `migration_project_user.py`; ensure the script version used reflects this change.
+- Customize placeholder domain by editing `id_key@placeholder.local` in `migration_project_user.py` if needed.
+
 ## Prerequisites
 
 - **Python 3.8+**

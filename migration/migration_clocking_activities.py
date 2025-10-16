@@ -20,6 +20,45 @@ TASK_ID_MAP = {
     "wfo": 7,
 }
 
+def map_priority(priority):
+    mapping = {
+        'H': 'High',
+        'M': 'Medium',
+        'L': 'Low'
+    }
+    try:
+        return mapping.get(str(priority))
+    except Exception:
+        return None
+
+# --- Helpers for Daily Activities migration ---
+def get_user_id_from_key(cursor, user_key):
+    """Lookup source ss_user.id by id_key."""
+    try:
+        cursor.execute("SELECT id FROM ss_user WHERE id_key = %s", (user_key,))
+        result = cursor.fetchone()
+        return result[0] if result else None
+    except Exception:
+        return None
+
+def daily_activity_exists(target_cursor, da_id):
+    try:
+        target_cursor.execute("SELECT 1 FROM daily_activities WHERE daily_activity_id = %s LIMIT 1", (da_id,))
+        return target_cursor.fetchone() is not None
+    except Exception:
+        return False
+
+def get_target_user_id_from_id_key(cursor, id_key):
+    try:
+        if not id_key:
+            return None
+        placeholder_email = f"{id_key}@placeholder.local"
+        cursor.execute("SELECT user_id FROM users WHERE email = %s", (placeholder_email,))
+        res = cursor.fetchone()
+        return res[0] if res else None
+    except Exception:
+        return None
+
 def compute_diff_minutes(start_date, start_time, end_date, end_time):
     try:
         if not (start_date and start_time and end_date and end_time):
@@ -84,6 +123,93 @@ def backfill_clocking_fields(target_cursor, target_db):
     target_db.commit()
 
 
+def migrate_daily_activity():
+    config = {
+        "host": "localhost",
+        "user": "root",
+        "password": ""  # Adjust with your credentials if needed
+    }
+
+    source_db = connect_db(**config, db="system-smartpro")  # Source db name
+    target_db = connect_db(**config, db="clocking_reports")  # Target db name
+
+    source_cursor = source_db.cursor(dictionary=True)
+    target_cursor = target_db.cursor()
+    user_lookup_cursor = source_db.cursor()  # Lookup id from ss_user in source DB
+
+    source_cursor.execute("SELECT * FROM ss_daily_activity")
+    rows = source_cursor.fetchall()
+
+    insert_query = """
+        INSERT INTO daily_activities (
+            daily_activity_id, project_code, activity_date, priority,
+            start_time, end_time, created_by, created_at,
+            updated_at, activity_type, description,
+            activity_duration_minutes, user_id
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """
+
+    inserted_total = 0
+    inserted_with_user = 0
+    inserted_without_user = 0
+    skipped_parse_errors = 0
+
+    for row in rows:
+        # Extract id_key from da_data JSON
+        da_data = row.get("da_data", "{}")
+        user_key = None
+        try:
+            da_data_json = json.loads(da_data) if isinstance(da_data, str) else da_data
+            if isinstance(da_data_json, dict):
+                user_key = da_data_json.get("id_key")
+        except json.JSONDecodeError:
+            skipped_parse_errors += 1
+
+        user_id = None
+        if user_key:
+            user_id = get_user_id_from_key(user_lookup_cursor, user_key)
+
+        # Avoid duplicate if already present
+        da_id = row.get("da_id")
+        if daily_activity_exists(target_cursor, da_id):
+            continue
+
+        target_cursor.execute(insert_query, (
+            da_id,
+            row.get("da_project_code"),
+            row.get("da_date"),
+            map_priority(row.get("da_priority")),
+            row.get("da_start_tm"),
+            row.get("da_end_tm"),
+            row.get("da_created_by"),
+            row.get("da_created_date"),
+            row.get("da_updated_date"),
+            row.get("da_activity"),
+            row.get("da_keterangan"),
+            row.get("da_duration"),
+            user_id,
+        ))
+        inserted_total += 1
+        if user_id is not None:
+            inserted_with_user += 1
+        else:
+            inserted_without_user += 1
+
+    target_db.commit()
+    print(
+        f"✅ Inserted: {inserted_total} daily activity records. "
+        f"(with user: {inserted_with_user}, without user: {inserted_without_user})"
+    )
+    if skipped_parse_errors:
+        print(f"⚠️ JSON parse issues: {skipped_parse_errors} records (da_data invalid).")
+
+    source_cursor.close()
+    target_cursor.close()
+    user_lookup_cursor.close()
+    source_db.close()
+    target_db.close()
+
+
 def migrate_clocking_activities():
     config = {
         "host": "localhost",
@@ -107,7 +233,14 @@ def migrate_clocking_activities():
             da_duration,
             da_date,
             da_start_tm,
-            da_end_tm
+            da_end_tm,
+            da_project_code,
+            da_priority,
+            da_created_by,
+            da_created_date,
+            da_updated_date,
+            da_keterangan,
+            da_data
         FROM ss_daily_activity
         """
     )
@@ -130,6 +263,16 @@ def migrate_clocking_activities():
             daily_activity_id, task_id, activity_description, duration_minutes, 
             start_date, start_time, end_date, end_time, category_id
         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """
+
+    # Prepare insert for missing parent daily_activities (auto-create)
+    daily_insert_query = """
+        INSERT INTO daily_activities (
+            daily_activity_id, project_code, activity_date, priority,
+            start_time, end_time, created_by, created_at,
+            updated_at, activity_type, description,
+            activity_duration_minutes, user_id
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
 
     inserted_total = 0
@@ -159,11 +302,39 @@ def migrate_clocking_activities():
                 # Fall back to empty list on invalid JSON
                 da_clocking = []
 
-        # If we have entries from JSON, insert them
+        # Ensure parent daily_activities exists; auto-create minimal row if missing
         if da_id not in existing_daily_ids:
-            # Cannot insert due to missing parent record in daily_activities
-            skipped_count += 1
-            continue
+            # Try map user via id_key -> placeholder email
+            id_key = None
+            try:
+                da_data_raw = row.get("da_data")
+                if da_data_raw:
+                    da_json = json.loads(da_data_raw) if isinstance(da_data_raw, str) else da_data_raw
+                    if isinstance(da_json, dict):
+                        id_key = da_json.get("id_key")
+            except json.JSONDecodeError:
+                id_key = None
+            user_id = get_target_user_id_from_id_key(target_cursor, id_key)
+
+            target_cursor.execute(
+                daily_insert_query,
+                (
+                    da_id,
+                    row.get("da_project_code"),
+                    row.get("da_date"),
+                    map_priority(row.get("da_priority")),
+                    row.get("da_start_tm"),
+                    row.get("da_end_tm"),
+                    row.get("da_created_by"),
+                    row.get("da_created_date"),
+                    row.get("da_updated_date"),
+                    row.get("da_activity"),
+                    row.get("da_keterangan"),
+                    row.get("da_duration"),
+                    user_id,
+                ),
+            )
+            existing_daily_ids.add(da_id)
 
         if isinstance(da_clocking, list) and len(da_clocking) > 0:
             for entry in da_clocking:
@@ -281,4 +452,6 @@ def migrate_clocking_activities():
     target_db.close()
 
 if __name__ == "__main__":
+    # Jalankan migrasi daily activities terlebih dahulu, lalu clocking
+    migrate_daily_activity()
     migrate_clocking_activities()
